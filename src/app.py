@@ -11,7 +11,7 @@ from datetime import timedelta
 from pdf_contract import render_pdf
 import time, base64
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.sessions import SessionMiddleware
+from security_core import Store, key, init as init_security, audit as append_audit, verify_audit, SessionMiddleware, Sessions
 from starlette.concurrency import run_in_threadpool
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -19,8 +19,8 @@ DATA=Path(os.environ.get('XIN_DATA','./data')); DATA.mkdir(parents=True,exist_ok
 BASE=os.environ.get('XIN_BASE_URL','https://xin.duojiayi.com').rstrip('/')
 SECRET=os.environ.get('XIN_SESSION_SECRET','')
 PASSWORD_HASH=os.environ.get('XIN_ADMIN_HASH','')
-if len(SECRET)<32 or not re.fullmatch(r'[a-f0-9]{32}:[a-f0-9]{64}',PASSWORD_HASH):
-    raise RuntimeError('请设置 XIN_SESSION_SECRET 和 XIN_ADMIN_HASH（见 README）')
+if not re.fullmatch(r'[a-f0-9]{32}:[a-f0-9]{64}',PASSWORD_HASH):
+    raise RuntimeError('请设置 XIN_ADMIN_HASH（见 README）')
 app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
 ORIGIN=BASE; RP_ID=urlsplit(BASE).hostname
 DEV=os.environ.get('XIN_DEV')=='1'
@@ -28,7 +28,8 @@ if DEV and RP_ID not in ('localhost','127.0.0.1','testserver'): raise RuntimeErr
 if not RP_ID or (not DEV and (urlsplit(BASE).scheme!='https' or urlsplit(BASE).path or urlsplit(BASE).query or urlsplit(BASE).fragment or urlsplit(BASE).username)):
     raise RuntimeError('XIN_BASE_URL must be an HTTPS origin')
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=[RP_ID]+(['testserver','localhost','127.0.0.1'] if DEV else []))
-app.add_middleware(SessionMiddleware,secret_key=SECRET,https_only=not (os.environ.get('XIN_DEV')=='1'),same_site='strict',max_age=3600,session_cookie='xin_session')
+STORE=Store(DATA,key('XIN_DATA_KEY'))
+app.add_middleware(SessionMiddleware,store=STORE,secure=not DEV)
 app.mount('/static',StaticFiles(directory=Path(__file__).parent/'static'),name='static')
 env=Environment(loader=FileSystemLoader(Path(__file__).parent/'templates'),autoescape=select_autoescape(['html']))
 LOCK=threading.Lock()
@@ -39,23 +40,24 @@ def canonical(x): return json.dumps(x,ensure_ascii=False,sort_keys=True,separato
 def pw_hash(p,salt): return hashlib.scrypt(p.encode(),salt=bytes.fromhex(salt),n=16384,r=8,p=1,dklen=32).hex()
 def password_ok(p):
     s,h=PASSWORD_HASH.split(':'); return hmac.compare_digest(pw_hash(p,s),h)
-@contextmanager
-def db():
-    c=sqlite3.connect(DATA/'xin.sqlite3',timeout=15); c.row_factory=sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
-    try:
-        yield c; c.commit()
-    except BaseException:
-        c.rollback(); raise
-    finally: c.close()
+db=STORE.db
+def log(c,event,subject='admin'):append_audit(c,STORE.auditkey,event,subject)
 with db() as c:
     c.executescript('''CREATE TABLE IF NOT EXISTS contracts(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL, created TEXT NOT NULL, lender TEXT NOT NULL, borrower TEXT NOT NULL, principal INTEGER NOT NULL, due TEXT NOT NULL, penalty INTEGER NOT NULL, doc BLOB NOT NULL, ledger BLOB NOT NULL, receipt BLOB, proof BLOB, ots_state TEXT NOT NULL DEFAULT 'none', attempts INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, contract_id TEXT NOT NULL REFERENCES contracts(id), name TEXT NOT NULL, data BLOB NOT NULL, created TEXT NOT NULL); CREATE TABLE IF NOT EXISTS login_attempts(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, since INTEGER NOT NULL); INSERT OR IGNORE INTO login_attempts VALUES(1,0,0);''')
 
 with db() as c:
+    init_security(c)
     cols={r['name'] for r in c.execute('PRAGMA table_info(contracts)')}
     for field in ('pdf','btc_verification'):
         if field not in cols: c.execute('ALTER TABLE contracts ADD COLUMN '+field+' BLOB')
     c.execute('''CREATE TABLE IF NOT EXISTS passkey_flow(contract_id TEXT PRIMARY KEY REFERENCES contracts(id), owner TEXT NOT NULL, stage TEXT NOT NULL, challenge BLOB NOT NULL, expires INTEGER NOT NULL, credential_id BLOB, public_key BLOB, sign_count INTEGER, registration BLOB)''')
+
+with db() as c:
+    c.executescript('''CREATE TABLE IF NOT EXISTS admin_passkey(id INTEGER PRIMARY KEY CHECK(id=1),credential_id BLOB NOT NULL,public_key BLOB NOT NULL,sign_count INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS admin_challenges(owner TEXT PRIMARY KEY,stage TEXT NOT NULL,challenge BLOB NOT NULL,expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS party_invites(contract_id TEXT NOT NULL REFERENCES contracts(id),role TEXT NOT NULL CHECK(role IN ('lender','borrower')),token_hash TEXT NOT NULL UNIQUE,pin_hash TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,receipt BLOB,PRIMARY KEY(contract_id,role));
+    CREATE TABLE IF NOT EXISTS party_flow(contract_id TEXT PRIMARY KEY,owner TEXT NOT NULL,stage TEXT NOT NULL,challenge BLOB NOT NULL,expires INTEGER NOT NULL,credential_id BLOB,public_key BLOB,sign_count INTEGER,registration BLOB);''')
+    verify_audit(c,STORE.auditkey)
 
 @app.middleware('http')
 async def headers(req,call_next):
@@ -81,11 +83,18 @@ def get_contract(c,id):
     if not row: raise HTTPException(404,'合同不存在')
     return row
 def get_token(c,token):
-    row=c.execute('SELECT * FROM contracts WHERE token_hash=?',(digest(token.encode()),)).fetchone()
-    if not row or row['revoked']: raise HTTPException(404,'邀请无效或已撤销')
-    if not row['receipt'] and datetime.now(timezone.utc)-datetime.fromisoformat(row['created'])>timedelta(days=7): raise HTTPException(410,'邀请已过期，请重新创建')
-    return row
-
+    party=c.execute('SELECT * FROM party_invites WHERE token_hash=?',(digest(token.encode()),)).fetchone()
+    if not party: raise HTTPException(404,'邀请无效、已撤销或为旧版本邀请')
+    row=get_contract(c,party['contract_id'])
+    if row['revoked']: raise HTTPException(404,'邀请已撤销')
+    if not party['receipt'] and datetime.now(timezone.utc)-datetime.fromisoformat(row['created'])>timedelta(days=7): raise HTTPException(410,'邀请已过期')
+    r=dict(row); role=party['role']
+    r.update(role=role,party_name=row[role],party_key=row['id']+'-'+role,receipt=party['receipt'],attempts=party['attempts'],pin_hash=party['pin_hash'])
+    return r
+def parties(c,id):
+    return {p['role']:p['receipt'] for p in c.execute('SELECT role,receipt FROM party_invites WHERE contract_id=?',(id,))}
+def consent_for(role):
+    return '本人已阅读全文，确认明细及欠款真实准确，自愿确认并承诺履行还款义务。' if role=='borrower' else '本人已阅读全文，确认借款及还款明细、剩余本金及约定条款真实准确，自愿确认。'
 def money(s):
     try:
         d=Decimal(str(s)); cents=d*100
@@ -124,12 +133,15 @@ async def login_post(req:Request):
         n=a['failures'] if now-a['since']<900 else 0; since=a['since'] if n else now
         if n>=10: return page(req,'login',error='尝试次数过多，请15分钟后重试')
         if not password_ok(p):
-            c.execute('UPDATE login_attempts SET failures=?,since=? WHERE id=1',(n+1,since)); return page(req,'login',error='密码错误')
+            c.execute('UPDATE login_attempts SET failures=?,since=? WHERE id=1',(n+1,since)); log(c,'admin.password_failed'); return page(req,'login',error='密码错误')
         c.execute('UPDATE login_attempts SET failures=0,since=0 WHERE id=1')
-    req.session.clear(); req.session['admin']=True; return redirect('/admin')
+    req.session.clear(); req.session.update(_rotate=True,auth_flow=secrets.token_urlsafe(32),auth_until=int(time.time())+300); return redirect('/auth/passkey')
 @app.post('/logout')
 async def logout(req:Request):
-    f=await req.form(); check_csrf(req,f); req.session.clear(); return redirect('/login')
+    f=await req.form(); check_csrf(req,f)
+    if req.session.get('admin'):
+        with db() as c: log(c,'admin.logout')
+    req.session.clear(); req.session['_rotate']=True; return redirect('/login')
 @app.get('/admin')
 def dashboard(req:Request):
     admin(req)
@@ -146,30 +158,36 @@ async def create(req:Request):
     except ValueError: raise HTTPException(400,'还款日期错误')
     items,total=parse_ledger(str(f.get('ledger',''))); penalty=money(f.get('penalty','0'))
     id=secrets.token_hex(12); token=secrets.token_urlsafe(32); pin=str(secrets.randbelow(90000000)+10000000); created=utc(); ledger=canonical(items)
+    lender_token=secrets.token_urlsafe(32); lender_pin=str(secrets.randbelow(90000000)+10000000)
     lines='\n'.join(f"{x['date']} | {x['type']} | ￥{yuan(x['amount_cents'])} | {x['note']}" for x in items)
     doc=(f'多笔借款结算及债务确认书\n编号：{id}\n出借人：{lender}\n借款人：{borrower}\n'
          f'双方应核实历史多笔借款及还款。借款人确认相关款项已实际收到，经结算尚欠借款本金人民币 {yuan(total)} 元。本文件为既有债务确认，不要求再次交付款项。\n'
          f'借款人承诺最迟于 {due}（含当日）足额偿还剩余本金，期限内免息，可提前还款。\n'
          f'逾期约定一次性违约金人民币 {yuan(penalty)} 元，不重复计收、不计入本金；超出法律司法保护范围的部分依法调减。\n'
          '争议由双方协商解决，协商不成依法向有管辖权的人民法院起诉。\n'
-         '本文件仅记录借款人在线确认，身份真实性及证据效力需结合实际转账、聊天、纸质原件等材料认定。\n'
+         '本文件记录双方各自在线确认，身份真实性及证据效力需结合实际转账、聊天、纸质原件等材料认定。\n'
          f'借款结算明细（人民币）：\n{lines}\n净欠款：￥{yuan(total)}\n明细 SHA-256：{digest(ledger)}\n').encode()
     pdf=render_pdf(doc.decode('utf-8'))
-    with db() as c: c.execute('INSERT INTO contracts(id,token_hash,pin_hash,created,lender,borrower,principal,due,penalty,doc,ledger,pdf) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(id,digest(token.encode()),pw_hash(pin,id[:32]),created,lender,borrower,total,due,penalty,doc,ledger,pdf))
-    return page(req,'invite',id=id,url=BASE+'/s/'+token,pin=pin)
+    with db() as c:
+        c.execute('INSERT INTO contracts(id,token_hash,pin_hash,created,lender,borrower,principal,due,penalty,doc,ledger,pdf) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(id,digest(secrets.token_bytes(32)),pw_hash(secrets.token_urlsafe(32),id),created,lender,borrower,total,due,penalty,doc,ledger,pdf))
+        for role,t,p in [('borrower',token,pin),('lender',lender_token,lender_pin)]:
+            c.execute('INSERT INTO party_invites(contract_id,role,token_hash,pin_hash) VALUES(?,?,?,?)',(id,role,digest(t.encode()),pw_hash(p,id)))
+        log(c,'contract.create',id)
+    return page(req,'invite',id=id,url=BASE+'/s/'+token,pin=pin,lender_url=BASE+'/s/'+lender_token,lender_pin=lender_pin)
 @app.get('/c/{id}')
 def detail(req:Request,id:str):
     admin(req)
     with db() as c:
-        r=get_contract(c,id); attachments=c.execute('SELECT id,name,created,length(data) AS size FROM attachments WHERE contract_id=?',(id,)).fetchall()
-    return page(req,'detail',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),attachments=attachments)
+        r=get_contract(c,id); attachments=c.execute('SELECT id,name,created,length(data) AS size FROM attachments WHERE contract_id=?',(id,)).fetchall(); party_status={k:bool(v) for k,v in parties(c,id).items()}
+    return page(req,'detail',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),attachments=attachments,party_status=party_status)
 @app.post('/c/{id}/revoke')
 async def revoke(req:Request,id:str):
     admin(req); f=await req.form(); check_csrf(req,f)
-    with db() as c: c.execute('UPDATE contracts SET revoked=1 WHERE id=? AND receipt IS NULL',(id,))
+    with db() as c:
+        if c.execute('UPDATE contracts SET revoked=1 WHERE id=? AND receipt IS NULL AND revoked=0',(id,)).rowcount: log(c,'contract.revoke',id)
     return redirect('/c/'+id)
 def unlocked(req,r):
-    return req.session.get('unlocked')==r['id'] and req.session.get('unlocked_until',0)>int(time.time())
+    return req.session.get('unlocked')==r['party_key'] and req.session.get('unlocked_until',0)>int(time.time())
 
 @app.get('/s/{token}')
 def sign(req:Request,token:str):
@@ -177,7 +195,7 @@ def sign(req:Request,token:str):
     if r['receipt']: return page(req,'used')
     if not r['pdf']: raise HTTPException(409,'旧版未确认合同请撤销后重新创建')
     if not unlocked(req,r): return page(req,'unlock')
-    return page(req,'sign',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),pdfsha=digest(r['pdf']))
+    return page(req,'sign',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),pdfsha=digest(r['pdf']),role=r['role'],consent=consent_for(r['role']))
 
 @app.post('/s/{token}/unlock')
 async def unlock(req:Request,token:str):
@@ -187,9 +205,9 @@ async def unlock(req:Request,token:str):
         if r['receipt']: raise HTTPException(409)
         if r['attempts']>=8: raise HTTPException(429,'邀请已锁定')
         if not hmac.compare_digest(pw_hash(str(f.get('pin',''))[:32],r['id']),r['pin_hash']):
-            c.execute('UPDATE contracts SET attempts=attempts+1 WHERE id=?',(r['id'],))
+            c.execute('UPDATE party_invites SET attempts=attempts+1 WHERE contract_id=? AND role=?',(r['id'],r['role'])); log(c,'party.pin_failed',r['party_key'])
             return page(req,'unlock',error='核验码错误')
-    req.session['unlocked']=r['id']; req.session['unlocked_until']=int(time.time())+600
+    req.session['unlocked']=r['party_key']; req.session['unlocked_until']=int(time.time())+600
     return redirect('/s/'+token)
 
 @app.post('/s/{token}')
@@ -213,9 +231,9 @@ def invite_pdf(req:Request,token:str):
 
 def b64(b): return base64.urlsafe_b64encode(b).decode().rstrip('=')
 def new_challenge(r,stage):
-    return secrets.token_bytes(32)+hashlib.sha256(canonical({'id':r['id'],'contract_sha256':digest(r['doc']),'pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'stage':stage})).digest()
+    return secrets.token_bytes(32)+hashlib.sha256(canonical({'id':r['id'],'contract_sha256':digest(r['doc']),'pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'role':r['role'],'typed_name':r['party_name'],'consent':consent_for(r['role']),'stage':stage})).digest()
 def get_flow(c,req,r,stage):
-    flow=c.execute('SELECT * FROM passkey_flow WHERE contract_id=?',(r['id'],)).fetchone()
+    flow=c.execute('SELECT * FROM party_flow WHERE contract_id=?',(r['party_key'],)).fetchone()
     if not flow or flow['stage']!=stage or flow['expires']<int(time.time()) or not hmac.compare_digest(flow['owner'],csrf(req)):
         raise HTTPException(409,'验证已过期或已使用，请重新开始')
     return flow
@@ -238,10 +256,10 @@ async def pk_start(req:Request,token:str):
     with db() as c:
         c.execute('BEGIN IMMEDIATE'); r=get_token(c,token)
         if r['receipt'] or not r['pdf'] or not unlocked(req,r): raise HTTPException(403)
-        if str(f.get('name','')).strip()!=r['borrower'] or f.get('consent')!='yes' or f.get('sha')!=digest(r['doc']) or f.get('pdfsha')!=digest(r['pdf']): raise HTTPException(400,'姓名、意愿或文书版本不匹配')
+        if str(f.get('name','')).strip()!=r['party_name'] or f.get('consent')!='yes' or f.get('sha')!=digest(r['doc']) or f.get('pdfsha')!=digest(r['pdf']): raise HTTPException(400,'姓名、意愿或文书版本不匹配')
         challenge=new_challenge(r,'registration')
-        opts=generate_registration_options(rp_id=RP_ID,rp_name='XIN 信',user_id=bytes.fromhex(r['id']),user_name=r['id'],user_display_name='XIN 合同确认',challenge=challenge,timeout=120000,authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED))
-        c.execute('INSERT OR REPLACE INTO passkey_flow(contract_id,owner,stage,challenge,expires) VALUES(?,?,?,?,?)',(r['id'],csrf(req),'register',challenge,int(time.time())+180))
+        opts=generate_registration_options(rp_id=RP_ID,rp_name='XIN 信',user_id=hashlib.sha256(r['party_key'].encode()).digest(),user_name=r['party_key'],user_display_name='XIN 合同确认 · '+r['role'],challenge=challenge,timeout=120000,authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED))
+        c.execute('INSERT OR REPLACE INTO party_flow(contract_id,owner,stage,challenge,expires) VALUES(?,?,?,?,?)',(r['party_key'],csrf(req),'register',challenge,int(time.time())+180))
     return JSONResponse(json.loads(options_to_json(opts)))
 
 @app.post('/s/{token}/passkey/register')
@@ -253,7 +271,7 @@ async def pk_register(req:Request,token:str):
         c.execute('BEGIN IMMEDIATE'); r=get_token(c,token)
         if r['receipt'] or not unlocked(req,r): raise HTTPException(403)
         flow=get_flow(c,req,r,'register')
-        c.execute("UPDATE passkey_flow SET stage='consumed' WHERE contract_id=?",(r['id'],))
+        c.execute("UPDATE party_flow SET stage='consumed' WHERE contract_id=?",(r['party_key'],))
         try:
             v=verify_registration_response(credential=f.get('credential'),expected_challenge=flow['challenge'],expected_rp_id=RP_ID,expected_origin=ORIGIN,require_user_verification=True)
         except Exception:
@@ -261,7 +279,7 @@ async def pk_register(req:Request,token:str):
         challenge=new_challenge(r,'assertion')
         opts=generate_authentication_options(rp_id=RP_ID,challenge=challenge,timeout=120000,allow_credentials=[PublicKeyCredentialDescriptor(id=v.credential_id)],user_verification=UserVerificationRequirement.REQUIRED)
         registration=canonical({'credential':f['credential'],'expected_challenge':b64(flow['challenge'])})
-        c.execute("UPDATE passkey_flow SET stage='assert',challenge=?,expires=?,credential_id=?,public_key=?,sign_count=?,registration=? WHERE contract_id=?",(challenge,int(time.time())+180,v.credential_id,v.credential_public_key,v.sign_count,registration,r['id']))
+        c.execute("UPDATE party_flow SET stage='assert',challenge=?,expires=?,credential_id=?,public_key=?,sign_count=?,registration=? WHERE contract_id=?",(challenge,int(time.time())+180,v.credential_id,v.credential_public_key,v.sign_count,registration,r['party_key']))
     return JSONResponse(json.loads(options_to_json(opts)))
 
 @app.post('/s/{token}/passkey/finish')
@@ -272,36 +290,53 @@ async def pk_finish(req:Request,token:str):
         c.execute('BEGIN IMMEDIATE'); r=get_token(c,token)
         if r['receipt'] or not unlocked(req,r): raise HTTPException(403)
         flow=get_flow(c,req,r,'assert')
-        c.execute("UPDATE passkey_flow SET stage='consumed' WHERE contract_id=?",(r['id'],))
+        c.execute("UPDATE party_flow SET stage='consumed' WHERE contract_id=?",(r['party_key'],))
         try:
             v=verify_authentication_response(credential=f.get('credential'),expected_challenge=flow['challenge'],expected_rp_id=RP_ID,expected_origin=ORIGIN,credential_public_key=flow['public_key'],credential_current_sign_count=flow['sign_count'],require_user_verification=True)
             if not hmac.compare_digest(v.credential_id,flow['credential_id']): raise ValueError('credential mismatch')
         except Exception:
             return JSONResponse({'detail':'Passkey 验证失败，请重新开始'},status_code=400)
-        receipt=canonical({'schema':'xin-confirmation-v2','contract_id':r['id'],'contract_sha256':digest(r['doc']),'contract_pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'typed_name':r['borrower'],'consent':'本人已阅读全文，确认明细及欠款真实准确，自愿确认并承诺履行还款义务。','method':'invite + separate PIN + typed name + WebAuthn user verification; not verified legal identity or CA signature','server_recorded_utc':utc(),'webauthn':{'rp_id':RP_ID,'origin':ORIGIN,'credential_id':b64(flow['credential_id']),'public_key_cose':b64(flow['public_key']),'registration':json.loads(flow['registration']),'assertion':f['credential'],'expected_challenge':b64(flow['challenge']),'sign_count_before':flow['sign_count'],'sign_count_after':v.new_sign_count}})
-        c.execute('UPDATE contracts SET receipt=? WHERE id=? AND receipt IS NULL',(receipt,r['id']))
-        c.execute('DELETE FROM passkey_flow WHERE contract_id=?',(r['id'],))
-    req.session.pop('unlocked',None); req.session.pop('unlocked_until',None); req.session['confirmed']=r['id']
+        receipt=canonical({'schema':'xin-party-v3','role':r['role'],'contract_id':r['id'],'contract_sha256':digest(r['doc']),'contract_pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'typed_name':r['party_name'],'consent':consent_for(r['role']),'method':'invite + separate PIN + typed name + WebAuthn user verification; not verified legal identity or CA signature','server_recorded_utc':utc(),'webauthn':{'rp_id':RP_ID,'origin':ORIGIN,'credential_id':b64(flow['credential_id']),'public_key_cose':b64(flow['public_key']),'registration':json.loads(flow['registration']),'assertion':f['credential'],'expected_challenge':b64(flow['challenge']),'sign_count_before':flow['sign_count'],'sign_count_after':v.new_sign_count}})
+        other=parties(c,r['id']).get('lender' if r['role']=='borrower' else 'borrower')
+        if other:
+            w=json.loads(other)['webauthn']
+            if w['credential_id']==b64(flow['credential_id']) or w['public_key_cose']==b64(flow['public_key']):
+                return JSONResponse({'detail':'双方必须使用不同凭据'},status_code=409)
+        c.execute('UPDATE party_invites SET receipt=? WHERE contract_id=? AND role=? AND receipt IS NULL',(receipt,r['id'],r['role']))
+        c.execute('DELETE FROM party_flow WHERE contract_id=?',(r['party_key'],))
+        log(c,'party.confirm',r['party_key'])
+        ps=parties(c,r['id'])
+        if ps.get('lender') and ps.get('borrower'):
+            final=canonical({'schema':'xin-confirmation-v3','contract_id':r['id'],'contract_sha256':digest(r['doc']),'contract_pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'parties':{k:json.loads(v) for k,v in ps.items()}})
+            c.execute('UPDATE contracts SET receipt=? WHERE id=? AND receipt IS NULL',(final,r['id']))
+            log(c,'contract.both_confirmed',r['id'])
+    req.session.pop('unlocked',None); req.session.pop('unlocked_until',None); req.session['confirmed']=r['id']; req.session['confirmed_role']=r['role']
     return JSONResponse({'next':'/confirmed/'+r['id']})
 
 @app.get('/confirmed/{id}')
 def confirmed(req:Request,id:str):
     if req.session.get('confirmed')!=id: raise HTTPException(403)
-    with db() as c: r=get_contract(c,id)
-    if not r['receipt']: raise HTTPException(409)
-    return page(req,'signed',id=id,sha=digest(r['receipt']))
+    with db() as c:
+        r=get_contract(c,id); own=parties(c,id).get(req.session.get('confirmed_role'))
+    if not own: raise HTTPException(409)
+    return page(req,'signed',id=id,sha=digest(r['receipt'] or own),both=bool(r['receipt']),revoked=bool(r['revoked']))
 
 @app.get('/copy/{id}')
 def copy(req:Request,id:str):
     if not req.session.get('admin') and req.session.get('confirmed')!=id: raise HTTPException(403)
-    with db() as c: r=get_contract(c,id)
-    if not r['receipt']: raise HTTPException(409,'尚未确认')
-    return archive(r,[])
+    with db() as c:
+        r=get_contract(c,id); ps=parties(c,id)
+    if not r['receipt'] and not ps.get(req.session.get('confirmed_role')): raise HTTPException(409,'尚未确认')
+    if not r['receipt'] and not req.session.get('admin'):ps={req.session['confirmed_role']:ps[req.session['confirmed_role']]}
+    return archive(r,[],ps)
 
-def archive(r,attachments):
+def archive(r,attachments,ps=None):
     files={'contract.txt':r['doc'],'ledger.json':r['ledger']}
     if r['pdf']: files['contract.pdf']=r['pdf']
     if r['receipt']: files['confirmation.json']=r['receipt']
+    else:
+        for role,value in (ps or {}).items():
+            if value:files['party-'+role+'.json']=value
     if r['btc_verification']: files['bitcoin-verification.json']=r['btc_verification']
     if r['proof']: files['confirmation.json.ots']=r['proof']
     for a in attachments: files['attachments/'+a['id']+'-'+a['name']]=a['data']
@@ -313,8 +348,9 @@ def archive(r,attachments):
 @app.get('/c/{id}/export')
 def export(req:Request,id:str):
     admin(req)
-    with db() as c: r=get_contract(c,id); a=c.execute('SELECT * FROM attachments WHERE contract_id=?',(id,)).fetchall()
-    return archive(r,a)
+    with db() as c:
+        r=get_contract(c,id); a=c.execute('SELECT * FROM attachments WHERE contract_id=?',(id,)).fetchall(); ps=parties(c,id);log(c,'contract.export',id)
+    return archive(r,a,ps)
 @app.post('/c/{id}/attach')
 async def attach(req:Request,id:str):
     admin(req); f=await req.form(); check_csrf(req,f); file=f.get('file')
@@ -326,7 +362,7 @@ async def attach(req:Request,id:str):
         c.execute('BEGIN IMMEDIATE'); get_contract(c,id)
         q=c.execute('SELECT count(*) AS n,coalesce(sum(length(data)),0) AS size FROM attachments WHERE contract_id=?',(id,)).fetchone()
         if q['n']>=30 or q['size']+len(data)>50*1024*1024: raise HTTPException(413,'每份合同附件限30个、合计50MB')
-        c.execute('INSERT INTO attachments VALUES(?,?,?,?,?)',(secrets.token_hex(8),id,name,data,utc()))
+        c.execute('INSERT INTO attachments VALUES(?,?,?,?,?)',(secrets.token_hex(8),id,name,data,utc())); log(c,'attachment.add',id)
     return redirect('/c/'+id)
 @app.post('/c/{id}/ots')
 async def ots(req:Request,id:str):
@@ -347,7 +383,8 @@ def stamp_record(id):
             if not proof.exists() or (result.returncode!=0 and not r['proof']): raise HTTPException(502,'OTS 请求失败，未标记成功')
             # A pending upgrade may exit nonzero; do not replace an existing proof unless command succeeded.
             if result.returncode!=0: return
-            with db() as c: c.execute('UPDATE contracts SET proof=?,ots_state=?,btc_verification=NULL WHERE id=?',(proof.read_bytes(),'proof_saved_unverified',id))
+            with db() as c:
+                c.execute('UPDATE contracts SET proof=?,ots_state=?,btc_verification=NULL WHERE id=?',(proof.read_bytes(),'proof_saved_unverified',id)); log(c,'ots.proof_saved',id)
 
 @app.post('/c/{id}/bitcoin-verify')
 async def btc_verify(req:Request,id:str):
@@ -362,6 +399,71 @@ def verify_record(id):
         if not r['receipt'] or not r['proof']: raise HTTPException(409,'暂无证明')
         try: result=verify_bitcoin(r['receipt'],r['proof'])
         except Exception:
-            with db() as c: c.execute("UPDATE contracts SET ots_state='proof_saved_unverified',btc_verification=NULL WHERE id=?",(id,))
+            with db() as c:
+                c.execute("UPDATE contracts SET ots_state='proof_saved_unverified',btc_verification=NULL WHERE id=?",(id,)); log(c,'bitcoin.verify_failed',id)
             raise HTTPException(503,'独立核验未通过或节点不可用；未标记链上成功')
-        with db() as c: c.execute("UPDATE contracts SET ots_state='bitcoin_verified',btc_verification=? WHERE id=?",(canonical(result),id))
+        with db() as c:
+            c.execute("UPDATE contracts SET ots_state='bitcoin_verified',btc_verification=? WHERE id=?",(canonical(result),id)); log(c,'bitcoin.verified',id)
+
+def pending(req):
+    owner=req.session.get('auth_flow')
+    if not owner or req.session.get('auth_until',0)<=int(time.time()) or req.session.get('admin'):raise HTTPException(403,'请重新输入管理员密码')
+    return owner
+
+@app.get('/auth/passkey')
+def admin_passkey(req:Request):
+    pending(req)
+    with db() as c: enroll=not c.execute('SELECT 1 FROM admin_passkey').fetchone()
+    return page(req,'admin_mfa',enroll=enroll)
+
+@app.post('/auth/passkey/start')
+async def admin_start(req:Request):
+    from webauthn import generate_registration_options,generate_authentication_options,options_to_json
+    from webauthn.helpers.structs import AuthenticatorSelectionCriteria,UserVerificationRequirement,ResidentKeyRequirement,PublicKeyCredentialDescriptor
+    f=await passkey_input(req); owner=pending(req); ch=secrets.token_bytes(32)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE');credential=c.execute('SELECT * FROM admin_passkey WHERE id=1').fetchone()
+        if credential:
+            stage='assert'
+            opts=generate_authentication_options(rp_id=RP_ID,challenge=ch,timeout=120000,allow_credentials=[PublicKeyCredentialDescriptor(id=credential['credential_id'])],user_verification=UserVerificationRequirement.REQUIRED)
+        else:
+            bootstrap=os.environ.get('XIN_ADMIN_ENROLL_TOKEN','')
+            if len(bootstrap)<32 or not hmac.compare_digest(bootstrap,str(f.get('bootstrap',''))):
+                log(c,'admin.enroll_denied');return JSONResponse({'detail':'必须使用服务器控制台生成的初始化密钥'},status_code=403)
+            stage='register'
+            opts=generate_registration_options(rp_id=RP_ID,rp_name='XIN 信',user_id=hashlib.sha256(b'xin-admin-v3').digest(),user_name='xin-admin',user_display_name='XIN administrator',challenge=ch,timeout=120000,authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED))
+        c.execute('DELETE FROM admin_challenges WHERE expires<=?',(int(time.time()),))
+        c.execute('INSERT OR REPLACE INTO admin_challenges VALUES(?,?,?,?)',(owner,stage,ch,int(time.time())+120))
+    return JSONResponse({'stage':stage,'options':json.loads(options_to_json(opts))})
+
+@app.post('/auth/passkey/finish')
+async def admin_finish(req:Request):
+    from webauthn import verify_registration_response,verify_authentication_response
+    f=await passkey_input(req);owner=pending(req)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        flow=c.execute('SELECT * FROM admin_challenges WHERE owner=? AND expires>?',(owner,int(time.time()))).fetchone()
+        if not flow:raise HTTPException(409,'挑战已过期或使用')
+        c.execute('DELETE FROM admin_challenges WHERE owner=?',(owner,))
+        stored=c.execute('SELECT * FROM admin_passkey WHERE id=1').fetchone()
+        try:
+            if flow['stage']=='register' and not stored:
+                v=verify_registration_response(credential=f.get('credential'),expected_challenge=flow['challenge'],expected_rp_id=RP_ID,expected_origin=ORIGIN,require_user_verification=True)
+                c.execute('INSERT INTO admin_passkey VALUES(1,?,?,?)',(v.credential_id,v.credential_public_key,v.sign_count));log(c,'admin.passkey_enrolled')
+                req.session.clear();req.session['_rotate']=True
+                return JSONResponse({'next':'/login'})
+            if flow['stage']!='assert' or not stored:raise ValueError('wrong stage')
+            v=verify_authentication_response(credential=f.get('credential'),expected_challenge=flow['challenge'],expected_rp_id=RP_ID,expected_origin=ORIGIN,credential_public_key=stored['public_key'],credential_current_sign_count=stored['sign_count'],require_user_verification=True)
+            if not hmac.compare_digest(v.credential_id,stored['credential_id']):raise ValueError('credential mismatch')
+            c.execute('UPDATE admin_passkey SET sign_count=? WHERE id=1',(v.new_sign_count,));log(c,'admin.mfa_verified')
+        except Exception:
+            log(c,'admin.passkey_failed');return JSONResponse({'detail':'验证失败，请重新开始'},status_code=400)
+    req.session.clear();req.session.update(admin=True,_rotate=True);return JSONResponse({'next':'/admin'})
+
+@app.post('/admin/revoke-sessions')
+async def revoke_sessions(req:Request):
+    admin(req);f=await req.form();check_csrf(req,f)
+    with db() as c:
+        Sessions(STORE).revoke_all(c);c.execute('DELETE FROM admin_challenges');c.execute('DELETE FROM party_flow');log(c,'admin.revoke_all')
+    req.session.clear();req.session['_rotate']=True
+    return redirect('/login')

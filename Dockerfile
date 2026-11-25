@@ -5,6 +5,7 @@ COPY requirements.txt .
 RUN apt-get update && apt-get install -y --no-install-recommends fonts-wqy-zenhei && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt && useradd -r -u 10001 xin && mkdir /data && chown xin:xin /data
 COPY src/ .
+COPY scripts/ops.py /app/ops.py
 USER xin
 EXPOSE 8000
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000","--no-access-log","--limit-concurrency","40"]
