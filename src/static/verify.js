@@ -14,11 +14,11 @@
   }catch(e){if(v===version)status.textContent=e.message;}
  });
  if(node)node.addEventListener('click',async()=>{
-  const v=version,selected=ots.files[0];if(!hash||!selected||selected.size>65536){out.textContent='请先计算原文件指纹，再选择不超过64 KB的 OTS 证明。';return;}
+  const v=version,selected=ots.files[0],submittedHash=hash;if(!hash||!selected||selected.size>65536){out.textContent='请先计算原文件指纹，再选择不超过64 KB的 OTS 证明。';return;}
   if(expected.value.trim()&&hash!==expected.value.trim().toLowerCase()){out.textContent='预期指纹不一致，请核对后再验证。';return;}
   node.disabled=true;report.hidden=true;out.textContent='正在核验配置的主网节点…';
   try{const proof=btoa(Array.from(new Uint8Array(await selected.arrayBuffer()),b=>String.fromCharCode(b)).join(''));
-   const r=await fetch('/verify/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sha256:hash,proof})});const j=await r.json();if(v!==version||selected!==ots.files[0])return;
+   const r=await fetch('/verify/node',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sha256:submittedHash,proof})});const j=await r.json();if(v!==version||selected!==ots.files[0])return;
    if(!r.ok)throw Error(typeof j.detail==='string'?j.detail:'主网未核验通过');out.textContent='本站配置节点核验通过（至少六个确认）。建议独立复核。';report.textContent='区块高度 '+j.height+'\n区块哈希 '+j.block_hash+'\n核验时间 '+j.verified_at_utc;report.hidden=false;
   }catch(e){if(v===version&&selected===ots.files[0])out.textContent=e.message;}finally{node.disabled=false;}
  });

@@ -102,9 +102,22 @@ def test_flow(monkeypatch,tmp_path):
     assert '双方' in verifier.verify_archive(f)
     r=a.post('/c/'+id+'/attach',data={'csrf':csrf(a.get('/c/'+id))},files={'file':('test.txt',b'example')});assert r.status_code==200
     z=zipfile.ZipFile(io.BytesIO(a.get('/c/'+id+'/export').content));m=json.loads(z.read('manifest.json'));assert all(digest(z.read(k))==v for k,v in m['files'].items())
-    def unavailable(*a,**kw):raise FileNotFoundError('test OTS unavailable')
-    monkeypatch.setattr('app.subprocess.run',unavailable)
-    assert a.post('/c/'+id+'/ots',data={'csrf':csrf(a.get('/c/'+id))}).status_code==503
-    assert a.post('/c/'+id+'/bitcoin-verify',data={'csrf':csrf(a.get('/c/'+id))}).status_code==409
+    from app import STORE
+    from proof_queue import run_one
+    with STORE.db() as c:
+        jobs=c.execute('SELECT * FROM proof_jobs WHERE contract_id=?',(id,)).fetchall()
+        assert {j['kind'] for j in jobs}=={'contract','attachment'}
+        aid=next(j['subject'] for j in jobs if j['kind']=='attachment')
+    assert outsider.get('/verify').status_code==200
+    assert outsider.get('/verify').headers.get('set-cookie') is None
+    monkeypatch.delenv('XIN_PUBLIC_NODE_VERIFY',raising=False)
+    assert outsider.post('/verify/node',json={}).status_code==404
+    assert outsider.get('/c/'+id+'/certificate').status_code==403
+    assert a.get('/c/'+id+'/certificate').status_code==409
+    assert a.post('/c/'+id+'/ots',data={'csrf':csrf(a.get('/c/'+id))}).status_code==200
+    assert a.post('/c/'+id+'/bitcoin-verify',data={'csrf':csrf(a.get('/c/'+id))}).status_code==200
+    assert run_one(STORE,update=lambda *_:b'test-proof',verify=lambda *_: (_ for _ in ()).throw(ValueError('not verified')))
+    assert a.get('/c/'+id+'/certificate').status_code==409
+    assert a.get('/c/'+id+'/attachments/'+aid+'/certificate').status_code==409
     assert a.post('/admin/revoke-sessions',data={'csrf':csrf(a.get('/admin'))}).status_code==200
     assert a.get('/admin').status_code==403 and b.get('/copy/'+id).status_code==403 and l.get('/copy/'+id).status_code==403

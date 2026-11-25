@@ -424,10 +424,14 @@ async def public_verify(req:Request):
     try:
         if time.monotonic()<PUBLIC_VERIFY_NEXT:raise HTTPException(429,'请稍后重试')
         PUBLIC_VERIFY_NEXT=time.monotonic()+60
+        import anyio
         body=bytearray()
-        async for chunk in req.stream():
-            body.extend(chunk)
-            if len(body)>90000:raise HTTPException(413)
+        try:
+            with anyio.fail_after(10):
+                async for chunk in req.stream():
+                    body.extend(chunk)
+                    if len(body)>90000:raise HTTPException(413)
+        except TimeoutError:raise HTTPException(408,'请求超时')
         try:
             f=json.loads(body)
             if not isinstance(f,dict) or set(f)!={'sha256','proof'} or not re.fullmatch('[0-9a-f]{64}',f['sha256']):raise ValueError()
