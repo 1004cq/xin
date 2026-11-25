@@ -319,7 +319,7 @@ def confirmed(req:Request,id:str):
     with db() as c:
         r=get_contract(c,id); own=parties(c,id).get(req.session.get('confirmed_role'))
     if not own: raise HTTPException(409)
-    return page(req,'signed',id=id,sha=digest(r['receipt'] or own),both=bool(r['receipt']))
+    return page(req,'signed',id=id,sha=digest(r['receipt'] or own),both=bool(r['receipt']),revoked=bool(r['revoked']))
 
 @app.get('/copy/{id}')
 def copy(req:Request,id:str):
