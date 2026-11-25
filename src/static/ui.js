@@ -1,0 +1,6 @@
+(() => {
+ const search=document.getElementById('record-search'),filter=document.getElementById('record-filter');
+ if(search&&filter){const records=[...document.querySelectorAll('[data-record]')],count=document.getElementById('filter-count'),empty=document.getElementById('filter-empty');
+ const update=()=>{const q=search.value.trim().toLocaleLowerCase();let n=0;for(const item of records){const name=item.querySelector('.record-name b').textContent.toLocaleLowerCase();const visible=(!q||name.includes(q))&&(filter.value==='all'||item.dataset.state===filter.value);item.hidden=!visible;if(visible)n++;}count.textContent='显示 '+n+' / '+records.length+' 份';empty.hidden=n!==0;};search.addEventListener('input',update);filter.addEventListener('change',update);update();}
+ const status=document.getElementById('copy-status');for(const button of document.querySelectorAll('[data-copy]')){button.addEventListener('click',async()=>{const field=document.getElementById(button.dataset.copy);try{await navigator.clipboard.writeText(field.value);status.textContent=button.dataset.copy==='invite-pin'?'核验码已复制，请单独发送。':'链接已复制，请通过独立渠道发送核验码。';}catch(e){field.focus();field.select();status.textContent='无法自动复制，请长按或使用系统复制。';}});}
+})();
