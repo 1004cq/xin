@@ -1,3 +1,21 @@
+# XIN 信 · v0.2 预发布
+
+## v0.2 预发布（需验收）
+
+新增 PIN 解锁（未签邀请 7 天过期）、每份新合同冻结 PDF、必须 WebAuthn 用户验证的确认流程、Bitcoin Core 独立核验与真实主网验收脚本。旧版未确认合同应撤销后重建；既有确认记录不得重签覆盖。Passkey 可由设备 PIN 或生物识别完成，不是身份证实名认证。管理员密码登录仍未升级 MFA。
+
+PDF 字体依赖 fonts-wqy-zenhei（Docker 自动安装），本地测试可设置 XIN_PDF_FONT 指向支持中文的 TrueType 字体。冻结 PDF 和正文都纳入 v2 确认记录；签名原始数据与 COSE 公钥一并归档。
+
+真实 Bitcoin 主网验收（在 Ubuntu 私有网络配置已同步节点）：
+```sh
+python scripts/ots_live.py stamp /tmp/xin-acceptance.dat
+# 日历升级及至少六个主网区块确认之后，再运行：
+python scripts/ots_live.py verify /tmp/xin-acceptance.dat
+```
+先通过安全的环境变量设置 XIN_BITCOIN_RPC_URL、XIN_BITCOIN_RPC_USER、XIN_BITCOIN_RPC_PASSWORD。容器中的节点地址必须从容器可访问，禁止将 8332 暴露公网；HTTP 仅用于受保护的私有网络。无节点时仅显示未验证。不要将密码提交仓库。报告的链上时间不等于精确签署时间。
+
+安全审查见 SECURITY-AUDIT.md。以下旧版介绍仅供 v0.1 历史参考；以本节及新代码为准。尚未真实联网测试、依赖漏洞扫描、生产部署或第三方安全审计，不得标为生产就绪。
+
 # XIN 信 · 私人数字存证 MVP 0.1.0
 
 目标域名：`xin.duojiayi.com`。Ubuntu 私人部署，不调用商业实名认证、CA 或电子合同 API。
