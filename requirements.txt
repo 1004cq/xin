@@ -6,4 +6,4 @@ itsdangerous>=2.2,<3
 opentimestamps-client>=0.7,<1
 webauthn>=2.2,<3
 reportlab>=4.4,<5
-cryptography>=45,<50
+cryptography>=50,<51

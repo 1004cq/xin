@@ -24,6 +24,10 @@ def rpc(method,*params):
     return response['result']
 
 def verify_bitcoin(data,proof):
+    return verify_digest(hashlib.sha256(data).digest(),proof)
+
+def verify_digest(expected,proof):
+    if len(expected)!=32: raise ValueError('invalid SHA-256 digest')
     from opentimestamps.core.timestamp import DetachedTimestampFile
     from opentimestamps.core.serialize import StreamDeserializationContext
     from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
@@ -31,11 +35,11 @@ def verify_bitcoin(data,proof):
     from bitcoin.core import CBlockHeader
     if len(proof)>1024*1024: raise ValueError('oversized proof')
     detached=DetachedTimestampFile.deserialize(StreamDeserializationContext(io.BytesIO(proof)))
-    expected=hashlib.sha256(data).digest()
     if not isinstance(detached.file_hash_op,OpSHA256) or detached.file_digest!=expected: raise ValueError('file hash mismatch')
     info=rpc('getblockchaininfo')
     if info.get('chain')!='main' or info.get('initialblockdownload') is not False: raise ValueError('mainnet node must be synced')
-    for msg,att in detached.timestamp.all_attestations():
+    for i,(msg,att) in enumerate(detached.timestamp.all_attestations()):
+        if i>=16: break
         if not isinstance(att,BitcoinBlockHeaderAttestation): continue
         if not 0<=att.height<=info['blocks']-5: continue
         bh=rpc('getblockhash',att.height)
