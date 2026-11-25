@@ -27,7 +27,9 @@ def enqueue(c,kind,subject,contract_id,data,proof=None,now=None):
 def seed(c):
     # Startup reconciliation for pre-v0.4 records, including old receipts and attachments.
     for r in c.execute('SELECT id,receipt,proof FROM contracts WHERE receipt IS NOT NULL').fetchall():
+        exists=c.execute("SELECT 1 FROM proof_jobs WHERE kind='contract' AND subject=?",(r['id'],)).fetchone()
         enqueue(c,'contract',r['id'],r['id'],r['receipt'],r['proof'])
+        if not exists:c.execute("UPDATE contracts SET btc_verification=NULL,ots_state=? WHERE id=?",('proof_saved_unverified' if r['proof'] else 'none',r['id']))
     for a in c.execute('SELECT id,contract_id,data FROM attachments').fetchall():
         enqueue(c,'attachment',a['id'],a['contract_id'],a['data'])
 
