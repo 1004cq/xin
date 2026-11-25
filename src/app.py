@@ -24,6 +24,7 @@ if len(SECRET)<32 or not re.fullmatch(r'[a-f0-9]{32}:[a-f0-9]{64}',PASSWORD_HASH
 app=FastAPI(docs_url=None,redoc_url=None,openapi_url=None)
 ORIGIN=BASE; RP_ID=urlsplit(BASE).hostname
 DEV=os.environ.get('XIN_DEV')=='1'
+if DEV and RP_ID not in ('localhost','127.0.0.1','testserver'): raise RuntimeError('XIN_DEV is restricted to localhost')
 if not RP_ID or (not DEV and (urlsplit(BASE).scheme!='https' or urlsplit(BASE).path or urlsplit(BASE).query or urlsplit(BASE).fragment or urlsplit(BASE).username)):
     raise RuntimeError('XIN_BASE_URL must be an HTTPS origin')
 app.add_middleware(TrustedHostMiddleware,allowed_hosts=[RP_ID]+(['testserver','localhost','127.0.0.1'] if DEV else []))
@@ -140,7 +141,7 @@ def new(req:Request): admin(req); return page(req,'new')
 async def create(req:Request):
     admin(req); f=await req.form(); check_csrf(req,f)
     lender=str(f.get('lender','')).strip(); borrower=str(f.get('borrower','')).strip()
-    if not lender or not borrower or max(len(lender),len(borrower))>80: raise HTTPException(400,'请填写真实双方姓名')
+    if not lender or not borrower or max(len(lender),len(borrower))>80 or any(ord(ch)<32 for ch in lender+borrower): raise HTTPException(400,'请填写真实双方姓名')
     try: due=date.fromisoformat(str(f.get('due',''))).isoformat()
     except ValueError: raise HTTPException(400,'还款日期错误')
     items,total=parse_ledger(str(f.get('ledger',''))); penalty=money(f.get('penalty','0'))
@@ -212,7 +213,7 @@ def invite_pdf(req:Request,token:str):
 
 def b64(b): return base64.urlsafe_b64encode(b).decode().rstrip('=')
 def new_challenge(r,stage):
-    return hashlib.sha256(canonical({'id':r['id'],'contract_sha256':digest(r['doc']),'pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'stage':stage,'nonce':secrets.token_hex(32)})).digest()
+    return secrets.token_bytes(32)+hashlib.sha256(canonical({'id':r['id'],'contract_sha256':digest(r['doc']),'pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'stage':stage})).digest()
 def get_flow(c,req,r,stage):
     flow=c.execute('SELECT * FROM passkey_flow WHERE contract_id=?',(r['id'],)).fetchone()
     if not flow or flow['stage']!=stage or flow['expires']<int(time.time()) or not hmac.compare_digest(flow['owner'],csrf(req)):
