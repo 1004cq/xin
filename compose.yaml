@@ -12,6 +12,20 @@ services:
       - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
     cap_drop: ["ALL"]
     mem_limit: 1g
+  proof-worker:
+    build: .
+    env_file: .env
+    command: ["python","proof_worker.py"]
+    depends_on: [xin]
+    restart: unless-stopped
+    volumes:
+      - xin-data:/data
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    cap_drop: ["ALL"]
+    mem_limit: 1g
   caddy:
     image: caddy:2
     restart: unless-stopped

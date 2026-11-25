@@ -9,6 +9,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from urllib.parse import urlsplit
 from datetime import timedelta
 from pdf_contract import render_pdf
+import proof_queue
+from proof_certificate import render_certificate
 import time, base64
 from fastapi.staticfiles import StaticFiles
 from security_core import Store, key, init as init_security, audit as append_audit, verify_audit, SessionMiddleware, Sessions
@@ -58,6 +60,7 @@ with db() as c:
     CREATE TABLE IF NOT EXISTS party_invites(contract_id TEXT NOT NULL REFERENCES contracts(id),role TEXT NOT NULL CHECK(role IN ('lender','borrower')),token_hash TEXT NOT NULL UNIQUE,pin_hash TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,receipt BLOB,PRIMARY KEY(contract_id,role));
     CREATE TABLE IF NOT EXISTS party_flow(contract_id TEXT PRIMARY KEY,owner TEXT NOT NULL,stage TEXT NOT NULL,challenge BLOB NOT NULL,expires INTEGER NOT NULL,credential_id BLOB,public_key BLOB,sign_count INTEGER,registration BLOB);''')
     verify_audit(c,STORE.auditkey)
+    proof_queue.init(c); proof_queue.seed(c)
 
 @app.middleware('http')
 async def headers(req,call_next):
@@ -178,8 +181,8 @@ async def create(req:Request):
 def detail(req:Request,id:str):
     admin(req)
     with db() as c:
-        r=get_contract(c,id); attachments=c.execute('SELECT id,name,created,length(data) AS size FROM attachments WHERE contract_id=?',(id,)).fetchall(); party_status={k:bool(v) for k,v in parties(c,id).items()}
-    return page(req,'detail',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),attachments=attachments,party_status=party_status)
+        r=get_contract(c,id); attachments=c.execute('SELECT a.id,a.name,a.created,length(a.data) AS size,j.state AS proof_state FROM attachments a LEFT JOIN proof_jobs j ON j.kind=\'attachment\' AND j.subject=a.id WHERE a.contract_id=?',(id,)).fetchall(); job=c.execute("SELECT state,due,failures,report,lease_until FROM proof_jobs WHERE kind='contract' AND subject=?",(id,)).fetchone(); party_status={k:bool(v) for k,v in parties(c,id).items()}
+    return page(req,'detail',r=r,doc=bytes(r['doc']).decode(),sha=digest(r['doc']),attachments=attachments,party_status=party_status,job=job,proof_labels=PROOF_LABELS,queue_due=datetime.fromtimestamp(job['due'],timezone.utc).isoformat(timespec='seconds') if job else None)
 @app.post('/c/{id}/revoke')
 async def revoke(req:Request,id:str):
     admin(req); f=await req.form(); check_csrf(req,f)
@@ -310,6 +313,7 @@ async def pk_finish(req:Request,token:str):
             final=canonical({'schema':'xin-confirmation-v3','contract_id':r['id'],'contract_sha256':digest(r['doc']),'contract_pdf_sha256':digest(r['pdf']),'ledger_sha256':digest(r['ledger']),'parties':{k:json.loads(v) for k,v in ps.items()}})
             c.execute('UPDATE contracts SET receipt=? WHERE id=? AND receipt IS NULL',(final,r['id']))
             log(c,'contract.both_confirmed',r['id'])
+            proof_queue.enqueue(c,'contract',r['id'],r['id'],final)
     req.session.pop('unlocked',None); req.session.pop('unlocked_until',None); req.session['confirmed']=r['id']; req.session['confirmed_role']=r['role']
     return JSONResponse({'next':'/confirmed/'+r['id']})
 
@@ -339,8 +343,11 @@ def archive(r,attachments,ps=None):
             if value:files['party-'+role+'.json']=value
     if r['btc_verification']: files['bitcoin-verification.json']=r['btc_verification']
     if r['proof']: files['confirmation.json.ots']=r['proof']
-    for a in attachments: files['attachments/'+a['id']+'-'+a['name']]=a['data']
-    files['manifest.json']=canonical({'schema':'xin-export-v1','files':{k:digest(v) for k,v in files.items()},'ots_state':r['ots_state'],'note':'Only confirmation.json is submitted to OTS; its hashes bind contract and ledger. Attachments added later are not covered. Manifest itself is not timestamped.'})
+    for a in attachments:
+        name='attachments/'+a['id']+'-'+a['name'];files[name]=a['data']
+        if a['attachment_proof']:files['attachment-proofs/'+a['id']+'.ots']=a['attachment_proof']
+        if a['attachment_report']:files['attachment-proofs/'+a['id']+'.json']=a['attachment_report']
+    files['manifest.json']=canonical({'schema':'xin-export-v1','files':{k:digest(v) for k,v in files.items()},'ots_state':r['ots_state'],'note':'confirmation.json and each attachment have separate OTS proofs. An attachment proof timestamps its bytes, not its relationship to the contract. Reports are historical node observations. Manifest itself is not timestamped.'})
     b=io.BytesIO()
     with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
         for k,v in files.items(): z.writestr(k,v)
@@ -349,7 +356,7 @@ def archive(r,attachments,ps=None):
 def export(req:Request,id:str):
     admin(req)
     with db() as c:
-        r=get_contract(c,id); a=c.execute('SELECT * FROM attachments WHERE contract_id=?',(id,)).fetchall(); ps=parties(c,id);log(c,'contract.export',id)
+        r=get_contract(c,id); a=c.execute("SELECT a.*,j.proof AS attachment_proof,j.report AS attachment_report,j.state AS proof_state FROM attachments a LEFT JOIN proof_jobs j ON j.kind='attachment' AND j.subject=a.id WHERE a.contract_id=?",(id,)).fetchall(); ps=parties(c,id);log(c,'contract.export',id)
     return archive(r,a,ps)
 @app.post('/c/{id}/attach')
 async def attach(req:Request,id:str):
@@ -362,48 +369,80 @@ async def attach(req:Request,id:str):
         c.execute('BEGIN IMMEDIATE'); get_contract(c,id)
         q=c.execute('SELECT count(*) AS n,coalesce(sum(length(data)),0) AS size FROM attachments WHERE contract_id=?',(id,)).fetchone()
         if q['n']>=30 or q['size']+len(data)>50*1024*1024: raise HTTPException(413,'每份合同附件限30个、合计50MB')
-        c.execute('INSERT INTO attachments VALUES(?,?,?,?,?)',(secrets.token_hex(8),id,name,data,utc())); log(c,'attachment.add',id)
+        aid=secrets.token_hex(8)
+        c.execute('INSERT INTO attachments VALUES(?,?,?,?,?)',(aid,id,name,data,utc())); log(c,'attachment.add',id)
+        proof_queue.enqueue(c,'attachment',aid,id,data)
     return redirect('/c/'+id)
+PROOF_LABELS={'queued':'已排队','retry':'提交失败，等待重试','pending':'等待主网核验','verified':'曾通过主网核验','blocked':'原文件异常，需人工处理'}
 @app.post('/c/{id}/ots')
-async def ots(req:Request,id:str):
-    admin(req); f=await req.form(); check_csrf(req,f)
-    await run_in_threadpool(stamp_record,id)
-    return redirect('/c/'+id)
-
-def stamp_record(id):
-    with LOCK:
-        with db() as c: r=get_contract(c,id)
-        if not r['receipt']: raise HTTPException(409,'先完成确认')
-        with tempfile.TemporaryDirectory() as tmp:
-            p=Path(tmp)/'confirmation.json'; p.write_bytes(r['receipt']); proof=Path(str(p)+'.ots')
-            if r['proof']: proof.write_bytes(r['proof']); cmd=['ots','upgrade',str(proof)]
-            else: cmd=['ots','stamp',str(p)]
-            try: result=subprocess.run(cmd,capture_output=True,timeout=90,check=False)
-            except (OSError,subprocess.TimeoutExpired): raise HTTPException(503,'OTS 不可用或超时，未标记成功')
-            if not proof.exists() or (result.returncode!=0 and not r['proof']): raise HTTPException(502,'OTS 请求失败，未标记成功')
-            # A pending upgrade may exit nonzero; do not replace an existing proof unless command succeeded.
-            if result.returncode!=0: return
-            with db() as c:
-                c.execute('UPDATE contracts SET proof=?,ots_state=?,btc_verification=NULL WHERE id=?',(proof.read_bytes(),'proof_saved_unverified',id)); log(c,'ots.proof_saved',id)
-
 @app.post('/c/{id}/bitcoin-verify')
-async def btc_verify(req:Request,id:str):
-    admin(req); f=await req.form(); check_csrf(req,f)
-    await run_in_threadpool(verify_record,id)
+async def ots(req:Request,id:str):
+    admin(req);f=await req.form();check_csrf(req,f)
+    with db() as c:
+        r=get_contract(c,id)
+        if not r['receipt']:raise HTTPException(409,'先完成双方确认')
+        proof_queue.enqueue(c,'contract',id,id,r['receipt'],r['proof'])
+        proof_queue.expedite(c,'contract',id)
+        log(c,'proof.expedite',id)
     return redirect('/c/'+id)
 
-def verify_record(id):
-    from bitcoin_proof import verify_bitcoin
-    with LOCK:
-        with db() as c: r=get_contract(c,id)
-        if not r['receipt'] or not r['proof']: raise HTTPException(409,'暂无证明')
-        try: result=verify_bitcoin(r['receipt'],r['proof'])
-        except Exception:
-            with db() as c:
-                c.execute("UPDATE contracts SET ots_state='proof_saved_unverified',btc_verification=NULL WHERE id=?",(id,)); log(c,'bitcoin.verify_failed',id)
-            raise HTTPException(503,'独立核验未通过或节点不可用；未标记链上成功')
-        with db() as c:
-            c.execute("UPDATE contracts SET ots_state='bitcoin_verified',btc_verification=? WHERE id=?",(canonical(result),id)); log(c,'bitcoin.verified',id)
+def certificate(c,kind,subject,contract_id):
+    j=c.execute('SELECT * FROM proof_jobs WHERE kind=? AND subject=? AND contract_id=?',(kind,subject,contract_id)).fetchone()
+    if not j or j['state']!='verified' or not j['report'] or not j['proof']:raise HTTPException(409,'没有通过核验的存证结果')
+    # Check the stored report binds exactly the retained source and proof.
+    data=proof_queue.source(c,j)
+    r=json.loads(j['report'])
+    if digest(data)!=j['file_hash'] or r.get('file_sha256')!=j['file_hash'] or r.get('proof_sha256')!=digest(j['proof']) or r.get('chain')!='bitcoin-mainnet' or r.get('confirmations_at_verification',0)<6:raise HTTPException(409,'存证结果不一致')
+    return r
+
+@app.get('/c/{id}/certificate')
+def contract_certificate(req:Request,id:str):
+    admin(req)
+    with db() as c:r=certificate(c,'contract',id,id)
+    return Response(render_certificate(r,BASE,'双方确认记录'),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename=xin-proof.pdf'})
+
+@app.get('/c/{id}/attachments/{aid}/certificate')
+def attachment_certificate(req:Request,id:str,aid:str):
+    admin(req)
+    with db() as c:r=certificate(c,'attachment',aid,id)
+    return Response(render_certificate(r,BASE,'独立附件'),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename=xin-attachment-proof.pdf'})
+
+@app.get('/verify')
+def verify_center(req:Request):
+    # No DB lookup, no session creation, no contract identifiers in URL.
+    return HTMLResponse(env.get_template('index.html').render(view='verify',node_enabled=os.environ.get('XIN_PUBLIC_NODE_VERIFY')=='1'))
+
+PUBLIC_VERIFY_LOCK=threading.Lock()
+PUBLIC_VERIFY_NEXT=0.0
+@app.post('/verify/node')
+async def public_verify(req:Request):
+    global PUBLIC_VERIFY_NEXT
+    if os.environ.get('XIN_PUBLIC_NODE_VERIFY')!='1':raise HTTPException(404)
+    if req.headers.get('origin')!=ORIGIN or req.headers.get('content-type','').split(';')[0]!='application/json':raise HTTPException(403)
+    # One concurrent request and a global cooldown, intentionally opt-in.
+    if not PUBLIC_VERIFY_LOCK.acquire(blocking=False):raise HTTPException(429,'核验繁忙')
+    try:
+        if time.monotonic()<PUBLIC_VERIFY_NEXT:raise HTTPException(429,'请稍后重试')
+        PUBLIC_VERIFY_NEXT=time.monotonic()+60
+        import anyio
+        body=bytearray()
+        try:
+            with anyio.fail_after(10):
+                async for chunk in req.stream():
+                    body.extend(chunk)
+                    if len(body)>90000:raise HTTPException(413)
+        except TimeoutError:raise HTTPException(408,'请求超时')
+        try:
+            f=json.loads(body)
+            if not isinstance(f,dict) or set(f)!={'sha256','proof'} or not re.fullmatch('[0-9a-f]{64}',f['sha256']):raise ValueError()
+            proof=base64.b64decode(f['proof'],validate=True)
+            if not 0<len(proof)<=65536:raise ValueError()
+        except (TypeError,ValueError,KeyError):raise HTTPException(400,'文件指纹或证明格式无效')
+        from bitcoin_proof import verify_digest
+        try: report=await run_in_threadpool(verify_digest,bytes.fromhex(f['sha256']),proof)
+        except Exception:raise HTTPException(422,'未通过主网核验：可能尚未确认、节点不可用或证明不匹配')
+        return JSONResponse(report)
+    finally:PUBLIC_VERIFY_LOCK.release()
 
 def pending(req):
     owner=req.session.get('auth_flow')
